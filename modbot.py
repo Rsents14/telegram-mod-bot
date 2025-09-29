@@ -269,6 +269,11 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    chat = u.effective_chat
+    await u.message.reply_text(f"Chat ID: {chat.id}")
+
+   
     # Collect text + caption + URLs
     pieces = []
     if msg.text: pieces.append(msg.text)
