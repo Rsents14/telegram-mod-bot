@@ -431,6 +431,8 @@ def main():
     app.add_handler(CommandHandler("rules", rules_cmd))
     app.add_handler(CommandHandler("trust", trust_cmd))
     app.add_handler(CommandHandler("untrust", untrust_cmd))
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
+
 
     # events & messages
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new))
