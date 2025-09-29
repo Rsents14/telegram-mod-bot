@@ -367,7 +367,12 @@ def main():
     # status updates and messages
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), filter_message))
-    app.add_handler(MessageHandler(filters.MEDIA, filter_message))  # handle captions
+    # captions on media (photos, videos, audio, voices, documents)
+media_filters = (
+    filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL
+)
+app.add_handler(MessageHandler(media_filters, filter_message))
+
 
     print("Bot starting...")
     app.run_polling()
