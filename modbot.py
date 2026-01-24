@@ -244,14 +244,33 @@ async def untrust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 # ---------- HANDLERS ----------
 async def welcome_new(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.message.new_chat_members: return
+    if not u.message or not u.message.new_chat_members:
+        return
+
     for m in u.message.new_chat_members:
+        first_name = m.first_name or "there"
+
+        welcome_text = (
+            f"👋 Welcome {first_name}!\n\n"
+            "We’re really glad you’ve joined the group.\n\n"
+            "Just a quick heads-up 👇\n\n"
+            "Sadly, a lot of Telegram groups similar to ours have been taken offline "
+            "or restricted without warning.\n\n"
+            "As a precaution, we’ve created a backup group.\n"
+            "You won’t be able to chat in there, but it *will* go live "
+            "if anything ever happens to this group.\n\n"
+            "👉 Please take a second to join the backup group:\n"
+            "https://t.me/+HHCWeu_GXjozZTQ0"
+        )
+
         try:
             await u.message.reply_text(
-                f"Welcome, {m.full_name}! 18+ space. Read /rules. Consent > everything."
+                welcome_text,
+                disable_web_page_preview=True
             )
         except Exception:
             pass
+
 
 async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = u.message
