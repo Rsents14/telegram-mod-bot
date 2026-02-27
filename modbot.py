@@ -218,12 +218,29 @@ async def warn_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         warnings[target.id] = 0
 
 async def rules_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    chat_id = u.effective_chat.id
+    now = datetime.utcnow()
+
+    last = last_rules_sent_at[chat_id]
+    if last and (now - last).total_seconds() < RULES_COOLDOWN_SECONDS:
+        # Within 6 hours: silently delete the /rules command message
+        try:
+            await u.message.delete()
+        except Exception:
+            pass
+        return
+
+    # Outside cooldown: post rules and update timestamp
+    last_rules_sent_at[chat_id] = now
+
     await u.message.reply_text(
         "Group rules:\n"
-        "1) 18+ only\n2) Consent always\n3) No dealing / illegal activity\n"
-        "4) No doxxing\n5) Move explicit media to DMs if asked"
+        "1) 18+ only\n"
+        "2) Consent always\n"
+        "3) No dealing / illegal activity\n"
+        "4) No doxxing\n"
+        "5) Don't be a dick, just suck one"
     )
-
 async def trust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(u, u.effective_user.id):
         return await u.message.reply_text("Admin only.")
