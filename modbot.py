@@ -49,11 +49,19 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("modbot")
 
 # ---------- STATE ----------
+# ---------- STATE ----------
 message_times = defaultdict(lambda: deque())     # user_id -> deque[timestamps] (anti-flood)
 warnings = defaultdict(int)                      # user_id -> warn count (manual /warn)
 user_offenses = defaultdict(int)                 # user_id -> number of dealer offenses detected
 restriction_until = dict()                       # user_id -> datetime of restriction end (for dealer flow)
 
+# /rules cooldown (per chat)
+RULES_COOLDOWN_SECONDS = 6 * 60 * 60
+last_rules_sent_at = defaultdict(lambda: None)   # chat_id -> datetime
+
+# Welcome batching (per chat)
+WELCOME_BATCH_SECONDS = 6 * 60 * 60
+pending_welcomes = defaultdict(list)             # chat_id -> list of "mentions" strings
 # ---------- REGEX (dealer ads) ----------
 PHONE_RE = re.compile(r"(?:(?:\+?\d{1,3}[\s\-\.]?)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{3,4}[\s\-\.]?\d{3,4})")
 WHATSAPP_LINK_RE = re.compile(r"(?:https?://)?(?:chat\.whatsapp\.com|wa\.me|whatsapp\.)[^\s]+", re.IGNORECASE)
