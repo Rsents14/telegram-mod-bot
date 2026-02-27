@@ -303,18 +303,42 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat = u.effective_chat
     await u.message.reply_text(f"Chat ID: {chat.id}")
 
-   
-    # Collect text + caption + URLs
+
+async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    msg = u.message
+    if not msg:
+        return
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    # Trusted bypass
+    if msg.from_user and msg.from_user.id in TRUSTED_USER_IDS:
+        return
+
+    # Admins bypass (configurable)
+    try:
+        if ADMIN_BYPASS and await is_admin(u, msg.from_user.id):
+            return
+    except Exception:
+        pass
+
+    # Collect text + caption + URL-like entities
     pieces = []
-    if msg.text: pieces.append(msg.text)
-    if msg.caption: pieces.append(msg.caption)
+    if msg.text:
+        pieces.append(msg.text)
+    if msg.caption:
+        pieces.append(msg.caption)
+
     try:
         entities = (msg.entities or []) + (msg.caption_entities or [])
         base = msg.text or msg.caption or ""
         for ent in entities:
-            if ent.type in ("url", "text_link"):
-                start = ent.offset; end = ent.offset + ent.length
+            if ent.type == "url":
+                start = ent.offset
+                end = ent.offset + ent.length
                 pieces.append(base[start:end])
+            elif ent.type == "text_link" and getattr(ent, "url", None):
+                pieces.append(ent.url)
     except Exception:
         pass
 
@@ -326,9 +350,12 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if score >= 3:
         user_id = msg.from_user.id
+
         # delete the message always
-        try: await msg.delete()
-        except Exception: pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
         now = datetime.utcnow()
         user_offenses[user_id] += 1
@@ -340,15 +367,16 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await restrict_until(u.effective_chat, user_id, until_dt, c)
 
             warn_text_group = (
-                f"{msg.from_user.first_name}, your message was deleted because you've broken the group rules. "
-                f"As a reminder, you cannot post drug-dealing adverts in this group. "
-                f"As a result, your ability to send messages has been restricted for 3 days. "
-                f"If you do this again after your restriction ends, you will be kicked out of the group."
+                f"{msg.from_user.first_name}, your message was deleted because it breaks the group rules. "
+                f"No drug-dealing adverts here. "
+                f"You’ve been restricted from messaging for 3 days. "
+                f"Do it again after that and you’ll be kicked."
             )
-            try: await u.effective_chat.send_message(warn_text_group)
-            except Exception: pass
+            try:
+                await u.effective_chat.send_message(warn_text_group)
+            except Exception:
+                pass
 
-            # admin log
             log_text = (
                 f"<b>Dealer Ad — FIRST OFFENSE</b>\n"
                 f"<b>User:</b> {html.escape(msg.from_user.full_name)} (id: <code>{user_id}</code>)\n"
@@ -365,7 +393,6 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         else:
             until_dt = restriction_until.get(user_id)
             if until_dt and now >= until_dt:
-                # kick (ban+unban so they can rejoin later if invited)
                 try:
                     await u.effective_chat.ban_member(user_id)
                     await u.effective_chat.unban_member(user_id)
@@ -390,12 +417,10 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 )
                 await send_admin_log(c, log_text)
 
-                # reset offense tracking after kick
                 user_offenses.pop(user_id, None)
                 restriction_until.pop(user_id, None)
                 return
             else:
-                # still in restriction period
                 try:
                     await u.effective_chat.send_message(
                         f"{msg.from_user.first_name}, you're currently restricted. "
@@ -416,6 +441,40 @@ async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await send_admin_log(c, log_text)
                 return
 
+    # ===== Other moderation (bad words, links, flood) =====
+    if any(b in down for b in BANNED_WORDS):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await u.effective_chat.send_message(f"{msg.from_user.first_name}, that language is not allowed.")
+        except Exception:
+            pass
+        return
+
+    if LINK_FILTER and ("http://" in down or "https://" in down or "t.me/" in down):
+        if not await is_admin(u, msg.from_user.id):
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await u.effective_chat.send_message(f"{msg.from_user.first_name}, links are not allowed.")
+            except Exception:
+                pass
+            return
+
+    cnt = record_message(msg.from_user.id)
+    if cnt >= FLOOD_LIMIT:
+        try:
+            await u.effective_chat.send_message(
+                f"{msg.from_user.first_name} — you're posting too much. Muted."
+            )
+            await mute_user(u.effective_chat, msg.from_user.id, MUTE_DURATION_SECONDS, c)
+            message_times[msg.from_user.id].clear()
+        except Exception:
+            pass
     # ===== Other moderation (swear/bad words, links, flood) =====
     if any(b in down for b in BANNED_WORDS):
         try: await msg.delete()
