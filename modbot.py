@@ -2,25 +2,10 @@
 """
 Telegram moderation bot + Photo Of The Week (python-telegram-bot v20+)
 
-Moderation Features:
-- /ban /kick /mute /unmute /pin /warn /rules /trust /untrust /chatid
-- Welcome new members (batched)
-- Anti-flood + link & bad-word filters
-- Dealer-ad detection (regex scoring):
-    * 1st offense (score >= 3): delete + restrict for 3 days + warn message
-    * 2nd offense AFTER restriction period: kick (ban+unban)
-- Admin logs to ADMIN_LOG_CHAT_ID
-
-Photo Of The Week Features:
-- Collects photos posted in the group during the week (optionally hashtag only)
-- Sunday 19:00 Europe/London: posts 5 random photos + a poll (1-5)
-- Monday 19:00 Europe/London: closes poll, announces winner, DMs winner
-
-ENV required:
-  TOKEN="123456:ABCdef..."               # from @BotFather
-Optional:
-  ADMIN_LOG_CHAT_ID="123456789"          # your user id or a private group id (numeric)
-  POTW_HASHTAG_ONLY="1"                  # only collect photos with #potw in caption
+Fixes:
+- Dealer detection no longer treats normal prices like "£50 hotel" as drug dealing.
+- Friendlier Tina messages.
+- /prompt and /tina commands added.
 """
 
 import os
@@ -40,92 +25,125 @@ from telegram.ext import (
 
 # ---------- CONFIG ----------
 TOKEN = os.environ.get("TOKEN") or os.environ.get("BOT_TOKEN")
-ADMIN_LOG_CHAT_ID = os.environ.get("ADMIN_LOG_CHAT_ID")  # numeric id as str or None
+ADMIN_LOG_CHAT_ID = os.environ.get("ADMIN_LOG_CHAT_ID")
 
-FLOOD_LIMIT = 5          # messages in window
-FLOOD_WINDOW = 8         # seconds
-WARN_BEFORE_MUTE = 2     # /warn threshold (separate from dealer logic)
+FLOOD_LIMIT = 5
+FLOOD_WINDOW = 8
+WARN_BEFORE_MUTE = 2
 MUTE_DURATION_SECONDS = 60 * 10
 LINK_FILTER = True
-BANNED_WORDS = {"nastyword1", "nastyword2"}  # customise
-ADMIN_BYPASS = True  # if True, admins are not moderated by filters
+BANNED_WORDS = {"nastyword1", "nastyword2"}
+ADMIN_BYPASS = True
 
-# Whitelist: users completely skipped by moderation
 TRUSTED_USER_IDS = set()
 
-# /rules cooldown (per chat)
 RULES_COOLDOWN_SECONDS = 6 * 60 * 60
-
-# Welcome batching (per chat)
 WELCOME_BATCH_SECONDS = 6 * 60 * 60
 
-# Photo Of The Week
 TZ = ZoneInfo("Europe/London")
 POTW_HASHTAG_ONLY = os.environ.get("POTW_HASHTAG_ONLY", "").strip() in {"1", "true", "True", "yes", "YES"}
 POTW_HASHTAG = "#potw"
 POTW_FINALISTS = 5
-POTW_SUNDAY_TIME = time(19, 0, tzinfo=TZ)   # 7pm UK
-POTW_MONDAY_TIME = time(19, 0, tzinfo=TZ)   # 7pm UK
+POTW_SUNDAY_TIME = time(19, 0, tzinfo=TZ)
+POTW_MONDAY_TIME = time(19, 0, tzinfo=TZ)
 POTW_DATA_FILE = "potw_data.json"
 
+CONVERSATION_PROMPTS = [
+    "Right then, question of the day: what’s your craziest meet story? Keep it funny, not criminal 😏",
+    "What’s your most embarrassing moment on a night out? Tina wants the gossip.",
+    "Tell us about the worst date you’ve ever been on. Bonus points if it sounds like a Netflix documentary.",
+    "What’s the funniest message someone has ever sent you on here?",
+    "What’s one thing people always get wrong about you?",
+    "Be honest: what’s your red flag that you pretend is a personality trait?",
+    "What’s the weirdest message you’ve ever received? No names, babes.",
+    "If your dating life had a title, what would it be?",
+    "What’s your biggest green flag in someone?",
+    "Photo of the week check-in 📸 Drop your best pic below.",
+]
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("modbot")
 
-
 # ---------- STATE ----------
-message_times = defaultdict(lambda: deque())     # user_id -> deque[timestamps]
-warnings = defaultdict(int)                      # user_id -> warn count
-user_offenses = defaultdict(int)                 # user_id -> dealer offenses
-restriction_until = dict()                       # user_id -> datetime restriction end
+message_times = defaultdict(lambda: deque())
+warnings = defaultdict(int)
+user_offenses = defaultdict(int)
+restriction_until = dict()
 
-last_rules_sent_at = defaultdict(lambda: None)   # chat_id -> datetime
-pending_welcomes = defaultdict(list)             # chat_id -> list of mentions
-last_welcome_sent_at = defaultdict(lambda: None) # chat_id -> datetime
+last_rules_sent_at = defaultdict(lambda: None)
+pending_welcomes = defaultdict(list)
+last_welcome_sent_at = defaultdict(lambda: None)
 
-# POTW in-memory state (mirrored to disk)
-# Structure:
-# {
-#   "chats": {
-#       "<chat_id>": {
-#           "submissions": [ { "file_id": "...", "user_id": 123, "user_name": "X", "msg_id": 456, "ts": "..." }, ... ],
-#           "current_week_poll": { "poll_message_id": 111, "options_map": [submission_index,...], "created_at": "..." }
-#       }
-#   }
-# }
 potw_state = {"chats": {}}
 
-
-# ---------- REGEX (dealer ads) ----------
+# ---------- REGEX ----------
 PHONE_RE = re.compile(r"(?:(?:\+?\d{1,3}[\s\-\.]?)?(?:\(?\d{2,4}\)?[\s\-\.]?)?\d{3,4}[\s\-\.]?\d{3,4})")
 WHATSAPP_LINK_RE = re.compile(r"(?:https?://)?(?:chat\.whatsapp\.com|wa\.me|whatsapp\.)[^\s]+", re.IGNORECASE)
 TELEGRAM_INVITE_RE = re.compile(r"(?:https?://)?t\.me\/joinchat\/[A-Za-z0-9_-]+", re.IGNORECASE)
-PRICE_WEIGHT_RE = re.compile(r"(\£|\$|€)\s?\d{1,4}(?:\.\d{1,2})?\s*(?:\/|per)?\s*(g|gram|gramme|kg|kilo|oz|ozs)?", re.IGNORECASE)
+
+PRICE_WEIGHT_RE = re.compile(
+    r"(\£|\$|€)\s?\d{1,4}(?:\.\d{1,2})?\s*(?:\/|per)?\s*(g|gram|gramme|grams|kg|kilo|oz|ozs)\b",
+    re.IGNORECASE
+)
+
+DRUG_WORDS_RE = re.compile(
+    r"\b(weed|bud|green|coke|cocaine|ket|ketamine|mdma|pills|xanax|m-cat|meow|gear|snow|hash|edibles)\b",
+    re.IGNORECASE
+)
+
 SELL_KEYWORDS = re.compile(
     r"\b(sell(?:ing|s)?|vendor|supply|bulk|kilo|kg|g for|grams|plug|connect|dm for price|price dm|pm price|"
     r"we have stock|got (?:weed|mdma|cocaine|coke|pills|xanax|ketamine|m-cat))\b",
     re.IGNORECASE
 )
+
 PAYMENT_RE = re.compile(r"\b(paypal|venmo|cashapp|bank transfer|btc|bitcoin|zelle|revolut)\b", re.IGNORECASE)
+
+SAFE_CONTEXT_RE = re.compile(
+    r"\b(hotel|room|travelodge|premier inn|airbnb|booking|stay|accommodation|taxi|train|ticket|rent|bill|food|shopping|deposit)\b",
+    re.IGNORECASE
+)
 
 
 def ad_score(text: str) -> int:
     s = 0
     t = (text or "").lower()
-    if PHONE_RE.search(t): s += 3
-    if WHATSAPP_LINK_RE.search(t): s += 4
-    if TELEGRAM_INVITE_RE.search(t): s += 3
-    if PRICE_WEIGHT_RE.search(t): s += 3
-    if SELL_KEYWORDS.search(t): s += 3
-    if PAYMENT_RE.search(t): s += 2
-    if re.fullmatch(r"\s*" + PHONE_RE.pattern + r"\s*", t): s += 2
+
+    has_safe_context = bool(SAFE_CONTEXT_RE.search(t))
+    has_drug_word = bool(DRUG_WORDS_RE.search(t))
+    has_selling_language = bool(SELL_KEYWORDS.search(t))
+    has_price_weight = bool(PRICE_WEIGHT_RE.search(t))
+    has_payment = bool(PAYMENT_RE.search(t))
+    has_phone = bool(PHONE_RE.search(t))
+    has_whatsapp = bool(WHATSAPP_LINK_RE.search(t))
+    has_telegram_invite = bool(TELEGRAM_INVITE_RE.search(t))
+
+    if has_safe_context and not has_drug_word and not has_selling_language and not has_whatsapp:
+        return 0
+
+    if has_drug_word:
+        s += 4
+    if has_selling_language:
+        s += 3
+    if has_price_weight:
+        s += 2
+    if has_whatsapp:
+        s += 3
+    if has_telegram_invite:
+        s += 2
+    if has_payment:
+        s += 1
+    if has_phone and (has_drug_word or has_selling_language or has_price_weight):
+        s += 1
+
     return s
 
 
-# ---------- POTW PERSISTENCE ----------
+# ---------- POTW ----------
 def _chat_key(chat_id: int) -> str:
     return str(chat_id)
+
 
 def potw_load():
     global potw_state
@@ -139,12 +157,14 @@ def potw_load():
         log.warning("POTW load failed: %s", e)
         potw_state = {"chats": {}}
 
+
 def potw_save():
     try:
         with open(POTW_DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(potw_state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("POTW save failed: %s", e)
+
 
 def potw_get_chat(chat_id: int) -> dict:
     ck = _chat_key(chat_id)
@@ -161,6 +181,7 @@ async def is_admin(update: Update, user_id: int) -> bool:
     except Exception:
         return False
 
+
 def record_message(user_id: int) -> int:
     now = datetime.utcnow()
     dq = message_times[user_id]
@@ -168,6 +189,7 @@ def record_message(user_id: int) -> int:
     while dq and (now - dq[0]).total_seconds() > FLOOD_WINDOW:
         dq.popleft()
     return len(dq)
+
 
 async def mute_user(chat, user_id: int, secs: int, ctx: ContextTypes.DEFAULT_TYPE):
     until = datetime.utcnow() + timedelta(seconds=secs)
@@ -177,12 +199,14 @@ async def mute_user(chat, user_id: int, secs: int, ctx: ContextTypes.DEFAULT_TYP
     except Exception as e:
         log.warning("mute_user failed: %s", e)
 
+
 async def restrict_until(chat, user_id: int, until_dt: datetime, ctx: ContextTypes.DEFAULT_TYPE):
     perms = ChatPermissions(can_send_messages=False)
     try:
         await ctx.bot.restrict_chat_member(chat.id, user_id, permissions=perms, until_date=until_dt)
     except Exception as e:
         log.warning("restrict_until failed: %s", e)
+
 
 async def send_admin_log(ctx: ContextTypes.DEFAULT_TYPE, text: str):
     if not ADMIN_LOG_CHAT_ID:
@@ -193,6 +217,7 @@ async def send_admin_log(ctx: ContextTypes.DEFAULT_TYPE, text: str):
     except Exception as e:
         log.warning("Failed to send admin log: %s\nLog:\n%s", e, text)
 
+
 def user_display_name(u) -> str:
     try:
         return u.full_name or u.first_name or "someone"
@@ -202,7 +227,8 @@ def user_display_name(u) -> str:
 
 # ---------- COMMANDS ----------
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("I'm the mod bot. Admins: /help")
+    await u.message.reply_text("I'm Tina, the mod bot. Admins: /help")
+
 
 async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
@@ -210,8 +236,19 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "/mute (reply) [minutes] | /unmute (reply)\n"
         "/pin (reply)  | /warn (reply)\n"
         "/rules | /trust (reply/id) | /untrust (reply/id)\n"
-        "/chatid"
+        "/prompt | /tina | /chatid"
     )
+
+
+async def prompt_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(random.choice(CONVERSATION_PROMPTS))
+
+
+async def tina_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "Tina is awake, caffeinated, and trying very hard not to accuse hotel guests of drug dealing today 💛"
+    )
+
 
 async def ban_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
@@ -225,6 +262,7 @@ async def ban_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         log.warning("ban failed: %s", e)
     await u.message.reply_text(f"Banned {user_display_name(target)}.")
 
+
 async def kick_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
         return await u.message.reply_text("Reply to the user's message to kick.")
@@ -232,11 +270,12 @@ async def kick_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await u.message.reply_text("Admin only.")
     target = u.message.reply_to_message.from_user
     try:
-        await u.effective_chat.kick_member(target.id)
+        await u.effective_chat.ban_member(target.id)
         await u.effective_chat.unban_member(target.id)
     except Exception as e:
         log.warning("kick failed: %s", e)
     await u.message.reply_text(f"Kicked {user_display_name(target)}.")
+
 
 async def mute_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
@@ -253,6 +292,7 @@ async def mute_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await mute_user(u.effective_chat, target.id, minutes * 60, c)
     await u.message.reply_text(f"Muted {user_display_name(target)} for {minutes} minutes.")
 
+
 async def unmute_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
         return await u.message.reply_text("Reply to the user's message to unmute.")
@@ -261,7 +301,6 @@ async def unmute_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     target = u.message.reply_to_message.from_user
     perms = ChatPermissions(
         can_send_messages=True,
-        can_send_media_messages=True,
         can_send_polls=True,
         can_send_other_messages=True,
         can_add_web_page_previews=True
@@ -271,6 +310,7 @@ async def unmute_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("unmute failed: %s", e)
     await u.message.reply_text(f"Unmuted {user_display_name(target)}.")
+
 
 async def pin_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
@@ -283,6 +323,7 @@ async def pin_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         log.warning("pin failed: %s", e)
     await u.message.reply_text("Pinned.")
 
+
 async def warn_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message.reply_to_message:
         return await u.message.reply_text("Reply to the user's message to warn.")
@@ -294,6 +335,7 @@ async def warn_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await mute_user(u.effective_chat, target.id, MUTE_DURATION_SECONDS, c)
         await u.message.reply_text(f"{user_display_name(target)} auto-muted for repeat warnings.")
         warnings[target.id] = 0
+
 
 async def rules_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_id = u.effective_chat.id
@@ -318,6 +360,7 @@ async def rules_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "5) Don't be a dick, just suck one"
     )
 
+
 async def trust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(u, u.effective_user.id):
         return await u.message.reply_text("Admin only.")
@@ -332,6 +375,7 @@ async def trust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await u.message.reply_text("Reply to a user or provide their numeric id.")
     TRUSTED_USER_IDS.add(uid)
     await u.message.reply_text(f"User {uid} added to trusted list.")
+
 
 async def untrust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(u, u.effective_user.id):
@@ -348,12 +392,12 @@ async def untrust_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     TRUSTED_USER_IDS.discard(uid)
     await u.message.reply_text(f"User {uid} removed from trusted list.")
 
+
 async def chatid_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    chat = u.effective_chat
-    await u.message.reply_text(f"Chat ID: {chat.id}")
+    await u.message.reply_text(f"Chat ID: {u.effective_chat.id}")
 
 
-# ---------- WELCOME BATCHING ----------
+# ---------- WELCOME ----------
 async def welcome_new(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.new_chat_members:
         return
@@ -362,6 +406,7 @@ async def welcome_new(u: Update, c: ContextTypes.DEFAULT_TYPE):
     for m in u.message.new_chat_members:
         name = (m.first_name or m.full_name or "someone").strip()
         pending_welcomes[chat_id].append(f"[{name}](tg://user?id={m.id})")
+
 
 async def welcome_flush_job(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
@@ -384,15 +429,14 @@ async def welcome_flush_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- PHOTO OF THE WEEK ----------
 def _is_photo_submission(msg) -> bool:
-    if not msg:
-        return False
-    if not msg.photo:
+    if not msg or not msg.photo:
         return False
     if not POTW_HASHTAG_ONLY:
         return True
     cap = (msg.caption or "").lower()
     txt = (msg.text or "").lower()
     return (POTW_HASHTAG in cap) or (POTW_HASHTAG in txt)
+
 
 async def potw_collect(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = u.message
@@ -404,7 +448,6 @@ async def potw_collect(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_id = u.effective_chat.id
     chat_state = potw_get_chat(chat_id)
 
-    # pick the biggest photo size file_id
     biggest = msg.photo[-1]
     submission = {
         "file_id": biggest.file_id,
@@ -416,8 +459,8 @@ async def potw_collect(u: Update, c: ContextTypes.DEFAULT_TYPE):
     chat_state["submissions"].append(submission)
     potw_save()
 
+
 async def potw_sunday_post(ctx: ContextTypes.DEFAULT_TYPE):
-    # Runs for ALL chats that have submissions
     for chat_id_str, chat_state in list(potw_state.get("chats", {}).items()):
         try:
             chat_id = int(chat_id_str)
@@ -428,11 +471,9 @@ async def potw_sunday_post(ctx: ContextTypes.DEFAULT_TYPE):
         if not subs:
             continue
 
-        # If there's an active poll still hanging around, don't start another
         if chat_state.get("current_week_poll"):
             continue
 
-        # Choose finalists
         chosen = random.sample(subs, k=min(POTW_FINALISTS, len(subs)))
         options_map = []
 
@@ -441,26 +482,24 @@ async def potw_sunday_post(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Post photos 1..N
         for i, s in enumerate(chosen, start=1):
             caption = f"Photo {i}\nSubmitted by: {s.get('user_name', 'someone')}"
             try:
                 await ctx.bot.send_photo(chat_id, s["file_id"], caption=caption)
             except Exception as e:
                 log.warning("Failed to send finalist photo to %s: %s", chat_id, e)
-            # store index in the original submissions list (best-effort)
+
             try:
                 idx = subs.index(s)
             except ValueError:
                 idx = None
             options_map.append(idx)
 
-        # Create poll with options 1..N
         poll_options = [str(i) for i in range(1, len(chosen) + 1)]
         try:
             poll_msg = await ctx.bot.send_poll(
                 chat_id=chat_id,
-                question="Vote for Photo of the Week (pick a number):",
+                question="Vote for Photo of the Week:",
                 options=poll_options,
                 is_anonymous=False,
                 allows_multiple_answers=False
@@ -473,6 +512,7 @@ async def potw_sunday_post(ctx: ContextTypes.DEFAULT_TYPE):
             potw_save()
         except Exception as e:
             log.warning("Failed to create poll in chat %s: %s", chat_id, e)
+
 
 async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
     for chat_id_str, chat_state in list(potw_state.get("chats", {}).items()):
@@ -494,14 +534,12 @@ async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
             potw_save()
             continue
 
-        # Stop poll and get final results
         try:
             final_poll = await ctx.bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
         except Exception as e:
             log.warning("Failed to stop poll in chat %s: %s", chat_id, e)
             continue
 
-        # Determine winner by highest voter_count
         if not final_poll or not getattr(final_poll, "options", None):
             continue
 
@@ -510,10 +548,9 @@ async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
             continue
 
         max_votes = max(counts)
-        top_indexes = [i for i, c in enumerate(counts) if c == max_votes]
-        winner_choice_index = random.choice(top_indexes)  # tie-breaker
+        top_indexes = [i for i, count in enumerate(counts) if count == max_votes]
+        winner_choice_index = random.choice(top_indexes)
 
-        # Map poll option index back to submission
         winner_sub_idx = None
         if winner_choice_index < len(options_map):
             winner_sub_idx = options_map[winner_choice_index]
@@ -522,10 +559,10 @@ async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
         if winner_sub_idx is not None and 0 <= winner_sub_idx < len(subs):
             winner = subs[winner_sub_idx]
 
-        # Announce
         if winner:
             winner_name = winner.get("user_name", "someone")
             winner_user_id = winner.get("user_id")
+
             try:
                 await ctx.bot.send_message(
                     chat_id,
@@ -535,7 +572,6 @@ async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # DM winner
             if winner_user_id:
                 try:
                     await ctx.bot.send_message(
@@ -543,15 +579,16 @@ async def potw_monday_announce(ctx: ContextTypes.DEFAULT_TYPE):
                         "🏆 You won Photo of the Week! Your photo got the most votes. Congrats! 🎉"
                     )
                 except Exception:
-                    # If they never started the bot in DM, Telegram will block this
                     pass
         else:
             try:
-                await ctx.bot.send_message(chat_id, f"🏆 Photo of the Week results are in! Winning option: {winner_choice_index + 1} with {max_votes} vote(s).")
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"🏆 Photo of the Week results are in! Winning option: {winner_choice_index + 1} with {max_votes} vote(s)."
+                )
             except Exception:
                 pass
 
-        # Reset for next week
         chat_state["submissions"] = []
         chat_state["current_week_poll"] = None
         potw_save()
@@ -565,25 +602,21 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if msg.from_user and msg.from_user.is_bot:
         return
 
-    # POTW collection (do this early, even if user is trusted/admin)
     try:
         if msg.photo:
             await potw_collect(u, c)
     except Exception:
         pass
 
-    # Trusted bypass for moderation
     if msg.from_user and msg.from_user.id in TRUSTED_USER_IDS:
         return
 
-    # Admins bypass (configurable)
     try:
         if ADMIN_BYPASS and msg.from_user and await is_admin(u, msg.from_user.id):
             return
     except Exception:
         pass
 
-    # Collect text + caption + URL-like entities
     pieces = []
     if msg.text:
         pieces.append(msg.text)
@@ -595,9 +628,7 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         base = msg.text or msg.caption or ""
         for ent in entities:
             if ent.type == "url":
-                start = ent.offset
-                end = ent.offset + ent.length
-                pieces.append(base[start:end])
+                pieces.append(base[ent.offset:ent.offset + ent.length])
             elif ent.type == "text_link" and getattr(ent, "url", None):
                 pieces.append(ent.url)
     except Exception:
@@ -608,7 +639,8 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # ===== Dealer ad detection =====
     score = ad_score(full_text)
-    if score >= 3 and msg.from_user:
+
+    if score >= 6 and msg.from_user:
         user_id = msg.from_user.id
 
         try:
@@ -626,8 +658,8 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await u.effective_chat.send_message(
-                    f"{msg.from_user.first_name}, your message was deleted for breaking the rules. "
-                    f"No drug-dealing adverts here. You’ve been restricted for 3 days."
+                    f"{msg.from_user.first_name}, Tina here 💛 I’ve removed that because it looks like it may involve buying/selling illegal substances. "
+                    f"We can’t allow that here, so you’ve been restricted for 3 days. If this was wrong, an admin can review it."
                 )
             except Exception:
                 pass
@@ -702,7 +734,9 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             try:
-                await u.effective_chat.send_message(f"{msg.from_user.first_name}, links are not allowed.")
+                await u.effective_chat.send_message(
+                    f"{msg.from_user.first_name}, Tina here 👋 Links need admin approval, so I’ve removed that one for now."
+                )
             except Exception:
                 pass
             return
@@ -713,7 +747,7 @@ async def filter_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if cnt >= FLOOD_LIMIT:
             try:
                 await u.effective_chat.send_message(
-                    f"{msg.from_user.first_name} — you're posting too much. Muted."
+                    f"{msg.from_user.first_name} — you're posting a bit too fast. Tina has muted you for a breather."
                 )
                 await mute_user(u.effective_chat, msg.from_user.id, MUTE_DURATION_SECONDS, c)
                 message_times[msg.from_user.id].clear()
@@ -730,7 +764,6 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
@@ -743,24 +776,21 @@ def main():
     app.add_handler(CommandHandler("trust", trust_cmd))
     app.add_handler(CommandHandler("untrust", untrust_cmd))
     app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("prompt", prompt_cmd))
+    app.add_handler(CommandHandler("tina", tina_cmd))
 
-    # events & messages
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), filter_message))
 
-    # photos/videos/etc (so captions get checked + POTW collects photos)
-    media_filters = (filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL)
+    media_filters = filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL
     app.add_handler(MessageHandler(media_filters, filter_message))
 
-    # periodic job to flush welcomes
     app.job_queue.run_repeating(welcome_flush_job, interval=60 * 10, first=60)
 
-    # POTW scheduled jobs (UK time)
-    # Sunday = 6, Monday = 0 in python-telegram-bot days format? PTB uses datetime.time + days tuple like (0..6) Mon..Sun
     app.job_queue.run_daily(potw_sunday_post, time=POTW_SUNDAY_TIME, days=(6,))
     app.job_queue.run_daily(potw_monday_announce, time=POTW_MONDAY_TIME, days=(0,))
 
-    print("Bot starting...")
+    print("Tina starting...")
     app.run_polling()
 
 
