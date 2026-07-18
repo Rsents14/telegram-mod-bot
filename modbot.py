@@ -1,4 +1,4 @@
-# modbot.py
+ modbot.py
 """
 Telegram moderation bot + Photo Of The Week (python-telegram-bot v20+)
 
